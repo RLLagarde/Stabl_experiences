@@ -16,10 +16,10 @@ from sklearn.utils import safe_mask
 from sklearn.utils.class_weight import compute_sample_weight
 from sklearn.utils.validation import _check_feature_names_in, check_is_fitted
 from tqdm.autonotebook import tqdm
-from .unionfind import UnionFind
+from stabl.unionfind import UnionFind
 import warnings
-from .utils import auto_mode_lambda_grid
-from .visualization import boxplot_features, scatterplot_features
+from stabl.utils import auto_mode_lambda_grid
+from stabl.visualization import boxplot_features, scatterplot_features
 
 
 def classic_bootstrap(y, n_subsamples, replace=True, class_weight=None, rng=np.random.default_rng(None), **kwargs):
@@ -240,10 +240,11 @@ def export_stabl_to_csv(stabl, path):
     )
     df_max_probs = df_max_probs.sort_values(by='Max Proba', ascending=False)
     df_max_probs.to_csv(Path(path, 'Max STABL scores.csv'))
+  
 
     if stabl.artificial_type is not None:
-        synthetic_index = [
-            f'artificial.{i + 1}' for i in range(stabl.X_artificial_.shape[1])]
+        n_noise = stabl.stabl_scores_artificial_.shape[0]
+        synthetic_index = [f"artificial.{i+1}" for i in range(n_noise)]
 
         df_noise = pd.DataFrame(
             data=stabl.stabl_scores_artificial_,
@@ -793,10 +794,6 @@ def fit_bootstrapped_sample(
 
 
 
-    
-
-
-
 
 
 class Stabl(SelectorMixin, BaseEstimator):
@@ -931,7 +928,7 @@ class Stabl(SelectorMixin, BaseEstimator):
                 solver='liblinear',
                 class_weight='balanced',
                 max_iter=int(1e6),
-                random_state=42
+                random_state=42, 
             ),
             lambda_grid=None,
             n_lambda=None,
@@ -951,7 +948,10 @@ class Stabl(SelectorMixin, BaseEstimator):
             sgl_groups=None,
             verbose=0,
             n_jobs=-1,
-            random_state=None
+            random_state=None,
+            repetition=None,
+            selection_mode="fdr",   # "fdr" ou "quantile"
+            quantile_q=0.10,
     ):
         if fdr_threshold_range is None:
             fdr_threshold_range = np.arange(0., 1., .01)
@@ -985,6 +985,10 @@ class Stabl(SelectorMixin, BaseEstimator):
         self.fdr_min_threshold_ = None
         self.explore_threshold = None
         self.fitted_lambda_grid_ = None
+        self.X_art = None
+        self.repetition = repetition
+        self.selection_mode = selection_mode
+        self.quantile_q = quantile_q
 
     def _check_lambda_grid(self):
         """Check if the lambda_grid is valid. Raise error if not.
@@ -1118,7 +1122,32 @@ class Stabl(SelectorMixin, BaseEstimator):
             for idx, i in enumerate(ng):
                 u.union(i, idx + n)
             return list(map(np.array, map(list, u.components())))
+        
+    def make_art(self, X, rng):
+        n_real = X.shape[1]
+        X_art  = np.empty_like(X)
+        for i in range(n_real):
+            if self.artificial_type == "knockoff":
+                sub_seed = int(rng.randint(0, 2**32)) #rng.integers ensure we have exactly our rng for this plot
+                np.random.seed(sub_seed) #initialize the random state what we're going to use for knock off.
+                sampler = GaussianSampler(
+                    X[:, [i]],
+                    method='equicorrelated',
+                )
+                X_art[:, i] = sampler.sample_knockoffs().flatten()
+        return X_art
+
     
+    def generate_noise_once(self, X):
+        base_rng = np.random.RandomState(self.random_state)
+        seeds = base_rng.randint(0, 2**32, size=(self.n_bootstraps))
+        self.X_art = []
+        for i in range((self.repetition)):
+            rng=np.random.RandomState(int(seeds[i]))
+            X_art_temp = self.make_art(X, rng)
+            self.X_art.append(X_art_temp)
+
+
     def _generate_artificial_batch(self, X, rng):
         n_real = X.shape[1]
         X_art  = np.empty_like(X)
@@ -1134,17 +1163,18 @@ class Stabl(SelectorMixin, BaseEstimator):
                 X_art[:, i] = sampler.sample_knockoffs().flatten()
         return X_art
     
-    def _one_bootstrap(self, X, y, subsample_idx, lambda_val, corr_groups, rng):
+    def _one_bootstrap(self, X, y, bs, subsample_idx, lambda_val, corr_groups, rng):
+        if self.artificial_type == "knockoff":
+            X_art = self.X_art[bs]
+        else: 
+            X_art = self._generate_artificial_batch(X, rng) #on génère le bruit sur tout X puis on applique le mask
         mask = safe_mask(X, subsample_idx)
         X_bs, y_bs = X[mask], y[mask]
-        X_art      = self._generate_artificial_batch(X_bs, rng)
-        X_full     = np.concatenate([X_bs, X_art], axis=1)
-
+        X_full = np.concatenate([X_bs, X_art[mask]], axis=1) #X_full = np.concatenate([X_bs, X_art], axis=1)
         model = clone(self.base_estimator).set_params(**lambda_val)
         if corr_groups is not None:
             model.set_params(groups=corr_groups)
         model.fit(X_full, y_bs)
-
         sel = SelectFromModel(model, threshold=self.bootstrap_threshold).get_support()
         return sel
 
@@ -1177,18 +1207,11 @@ class Stabl(SelectorMixin, BaseEstimator):
 
         n_lambdas = len(param_grid)
 
-         ###### here we can control where is the chance factor. Base_rng ensure that if we run the whole experience we always have the same noise generation.
-        #seeds is the size of n.boostraps which ensures each bootstrap have a random factor. If we want to change for lambda, we could have a seeds size of nlambda*nbts.
-        # in that case we need to modify, in the parallel factor : "rng=np.random.RandomState(int(seeds[bs, idx]))"
-        #####
-        base_rng = np.random.RandomState(self.random_state)  
-        #seeds = base_rng.randint(0, 2**32, size=self.n_bootstraps)
-        seeds = base_rng.randint(0, 2**32, size=(self.n_bootstraps, n_lambdas))
-        ####
-        #####
+         
 
         # Defining the number of injected noisy features
-        n_injected_noise = int(X.shape[1] * self.artificial_proportion)
+        # n_injected_noise = int(X.shape[1] * self.artificial_proportion)
+        n_injected_noise = X.shape[1]   # 1 bruit par variable réelle
 
         base_estimator = clone(self.base_estimator)
 
@@ -1200,6 +1223,7 @@ class Stabl(SelectorMixin, BaseEstimator):
         # __Synthetic features and coefs__
         if self.artificial_type is not None:
             self.stabl_scores_artificial_ = np.zeros((n_injected_noise, n_lambdas))
+            
 
             # # Only initialize those score if we use artificial features
             # self.stabl_scores_artificial_ = np.zeros(
@@ -1227,6 +1251,18 @@ class Stabl(SelectorMixin, BaseEstimator):
             random_state=self.random_state
         )
 
+        ###### here we can control where is the chance factor. Base_rng ensure that if we run the whole experience we always have the same noise generation.
+        #seeds is the size of n.boostraps which ensures each bootstrap have a random factor. If we want to change for lambda, we could have a seeds size of nlambda*nbts.
+        # in that case we need to modify, in the parallel factor : "rng=np.random.RandomState(int(seeds[bs, idx]))"
+        #####
+        base_rng = np.random.RandomState(self.random_state)
+        seeds = base_rng.randint(0, 2**32, size=(self.n_bootstraps, n_lambdas))
+        #seeds = base_rng.randint(0, 2**32, size=self.n_bootstraps)
+        ####
+        #####
+        if self.artificial_type == 'knockoff': ###here we ensure that for the knockoff option we only generate noise once.
+            self.generate_noise_once(X)
+
         # --Loop--
         leave = (self.verbose > 0)
         for idx, lambda_val in tqdm(
@@ -1239,15 +1275,18 @@ class Stabl(SelectorMixin, BaseEstimator):
                 disable=(not leave)
         ):
             # Computing the frequencies
+            
             selected_variables = Parallel(n_jobs=self.n_jobs)(
                 delayed(self._one_bootstrap)(
                     X,
                     y,
+                    bs%(self.repetition),
                     subsample_idx=bootstrap_indices[bs],
                     lambda_val=lambda_val,
                     corr_groups=corr_groups,
-                    #rng=np.random.RandomState(seeds[bs]) this gives one noise per boostrap
-                    rng=np.random.RandomState(int(seeds[bs, idx])) #this one gives one noise per bts/per lambda
+                    #rng=np.random.RandomState(1)
+                    rng=np.random.RandomState(seeds[bs%(self.repetition)]) #this gives one noise per boostrap
+                    #rng=np.random.RandomState(int(seeds[bs%(self.repetition), idx])) #this one gives one noise per bts/per lambda
                 )
                 for bs in range(self.n_bootstraps)
             )
@@ -1380,15 +1419,38 @@ class Stabl(SelectorMixin, BaseEstimator):
             This is a boolean array of shape
             [# input features], in which an element is True iff its
             corresponding feature is selected for retention. 
+
+        ______
+
+        Also implementing the quartile method if this method is choosen.
+
         """
         check_is_fitted(self, 'stabl_scores_')
 
-        new_threshold = self.hard_threshold if new_hard_threshold is None else new_hard_threshold
+        # new_threshold = self.hard_threshold if new_hard_threshold is None else new_hard_threshold
 
-        if new_threshold is None:
-            final_cutoff = self.fdr_min_threshold_
+        # if self.selection_mode == "quantile":
+        #     final_cutoff = self._compute_quantile_threshold()
+
+        # elif new_threshold is None:
+
+        #     final_cutoff = self.fdr_min_threshold_
+        # else:
+        #     final_cutoff = new_threshold
+
+#changing according to choosen mode. defininf priorities of the choice.
+#     
+        if new_hard_threshold is not None:
+            final_cutoff = new_hard_threshold
+
+        elif self.selection_mode == "quantile":
+            final_cutoff = self._compute_quantile_threshold()
+        
+        elif self.hard_threshold is not None:
+            final_cutoff = self.hard_threshold
+
         else:
-            final_cutoff = new_threshold
+            final_cutoff = self.fdr_min_threshold_
 
         max_scores = np.max(self.stabl_scores_, axis=1)
         mask = max_scores > final_cutoff
@@ -1506,6 +1568,41 @@ class Stabl(SelectorMixin, BaseEstimator):
             final_cutoff = np.min([self.fdr_threshold_range[np.argmin(self.FDRs_)], 1])
 
         self.fdr_min_threshold_ = final_cutoff
+
+####### INTRODUCTION TO QUARTILE 
+####### INTRODUCTION TO QUARTILE 
+####### INTRODUCTION TO QUARTILE 
+
+
+    def _compute_quantile_threshold(self):
+        """ 
+        define the quantile that we use. Ie if we give quantile = 0.10 it returns the threshold that select the top 10% of artificial features.
+        """
+        # checking that fit has been called otherwise won't work
+        check_is_fitted(self, 'stabl_scores_')
+
+        if self.artificial_type is None:
+            raise RuntimeError("no artificial features generated while quantile method selected.")
+
+        # importing scores of artificial features
+        max_scores_artificial = np.max(self.stabl_scores_artificial_, axis=1)
+
+        # defining the threshold
+        q = 1.0 - self.quantile_q          # so that giving 0.10 returns the threshold of the top 10% of artificial features.
+        threshold = np.quantile(max_scores_artificial, q)
+
+        return threshold
+    
+    # def compute_tolerance(self): ####try all threhsold taht keeps new FDR under 120% of the maximal FDR
+    #     """ 
+    #     define compute tolerance
+    #     """
+    #     final_cutoff = 
+
+####### INTRODUCTION TO QUARTILE 
+####### INTRODUCTION TO QUARTILE 
+####### INTRODUCTION TO QUARTILE 
+
 
     def get_different_parameters(self):
         """Get all the parameters modified in the gridSearch of a Stabl object.
